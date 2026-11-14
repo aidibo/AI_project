@@ -22,8 +22,10 @@ from .config import ObsConfig
 
 
 def _human_size(size: int) -> str:
+    """把字节数格式化成便于阅读的字符串，如 ``1.5MB``。"""
     value = float(size)
     for unit in ("B", "KB", "MB", "GB", "TB"):
+        # 小于 1024 或已到最大单位时停止换算。
         if value < 1024 or unit == "TB":
             return f"{int(value)}B" if unit == "B" else f"{value:.1f}{unit}"
         value /= 1024
@@ -31,15 +33,19 @@ def _human_size(size: int) -> str:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    """构建命令行参数解析器（每个子命令对应一类操作）。"""
     parser = argparse.ArgumentParser(prog="obs", description="华为云 OBS 操作工具")
+    # 全局选项：可临时覆盖配置里的桶与终端节点。
     parser.add_argument("--bucket", help="覆盖默认桶")
     parser.add_argument("--server", help="覆盖终端节点")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    # 无参数子命令。
     sub.add_parser("list-buckets", help="查看桶列表")
     sub.add_parser("mb", help="创建默认桶")
     sub.add_parser("demo", help="在默认桶上运行一次完整演示")
 
+    # 带参数子命令。
     p_ls = sub.add_parser("ls", help="查看文件列表")
     p_ls.add_argument("--prefix", default=None)
     p_ls.add_argument("--delimiter", default=None)
@@ -72,52 +78,63 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _run_demo(service: ObsService) -> None:
-    """在默认桶上演示查看 / 上传 / 列表 / 下载 / 临时地址 / 删除。"""
+    """在默认桶上依次演示：上传 → 查看 → 列表 → 下载 → 临时地址 → 复制 → 删除。"""
     key = "demo/hello.txt"
     print(f"[1] 默认桶: {service.bucket}")
 
+    # 上传一段文本，指定内容类型便于浏览器直接查看。
     print("[2] 上传文本")
     service.upload_bytes(key, "hello obs 你好", content_type="text/plain")
     print(f"    -> {key}")
 
+    # 查看对象的元数据（大小 / 类型 / ETag）。
     print("[3] 查看对象元数据")
     info = service.stat_object(key)
     print(f"    size={info.size} type={info.content_type} etag={info.etag}")
 
+    # 列出 demo/ 前缀下的对象（内部自动翻页）。
     print("[4] 文件列表（前缀 demo/）")
     for item in service.list_all_objects(prefix="demo/"):
         print(f"    {_human_size(item.size):>8}  {item.key}")
 
+    # 直接读回内容（小文件适合一次性读入内存）。
     print("[5] 下载内容")
     print(f"    -> {service.get_object_text(key)!r}")
 
+    # 生成 60 秒有效的下载链接。
     print("[6] 生成临时访问地址（GET，60 秒）")
     print(f"    {service.generate_download_url(key, expires=60)}")
 
+    # 复制一份，验证复制能力。
     print("[7] 复制对象")
     service.copy_object(key, "demo/hello-copy.txt")
     print("    demo/hello.txt -> demo/hello-copy.txt")
 
+    # 批量删除本次演示产生的对象，保持桶干净。
     print("[8] 删除对象")
     service.delete_objects([key, "demo/hello-copy.txt"])
     print("    done")
 
 
 def main(argv: list[str] | None = None) -> int:
+    """命令行主入口，返回进程退出码（0 成功、1 运行错误、2 配置错误）。"""
     args = _build_parser().parse_args(argv)
 
+    # 读取配置，并用命令行参数覆盖桶 / 终端节点。
     config = ObsConfig.from_env()
     if args.server:
         config.server = args.server
     if args.bucket:
         config.bucket = args.bucket
 
+    # list-buckets 不需要桶，其余命令都要求配置了默认桶。
     try:
         config.validate(require_bucket=args.command != "list-buckets")
     except ValueError as exc:
         print(f"配置错误：{exc}", file=sys.stderr)
         return 2
 
+    # with 语句确保退出时关闭客户端连接。
     try:
         with ObsService(config) as service:
             if args.command == "list-buckets":
@@ -135,6 +152,7 @@ def main(argv: list[str] | None = None) -> int:
                                             max_keys=args.max_keys)
                 for info in page.objects:
                     print(f"{_human_size(info.size):>10}  {info.last_modified or '':<24}  {info.key}")
+                # 公共前缀（“目录”）单独打印一行。
                 for prefix in page.prefixes:
                     print(f"{'DIR':>10}  {'':<24}  {prefix}")
 
@@ -143,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"已上传 {info.key}（{_human_size(info.size)}）")
 
             elif args.command == "download":
+                # 未指定目标路径时，用对象名的最后一段作为本地文件名。
                 dest = args.dest or os.path.basename(args.key)
                 print(f"已下载到 {service.download_file(args.key, dest)}")
 
@@ -159,6 +178,7 @@ def main(argv: list[str] | None = None) -> int:
                                                   expires=args.expires))
 
             elif args.command == "rm":
+                # 单个对象走单删，多个走批量删除。
                 if len(args.keys) == 1:
                     service.delete_object(args.keys[0])
                     print(f"已删除 {args.keys[0]}")
